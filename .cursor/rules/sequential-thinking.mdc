@@ -1,0 +1,10 @@
+---
+alwaysApply: true
+---
+
+Use sequential-thinking for:
+- schema design
+- import pipeline design
+- search/index tradeoff analysis
+- debugging ambiguous parsing logic
+Do not use it for trivial code edits.

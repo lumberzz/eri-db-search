@@ -1,0 +1,31 @@
+---
+description: Project architecture rule for local-first article database and fast search app
+globs: "**/*"
+alwaysApply: true
+---
+
+This project is a local-first web application for:
+
+* importing .xlsx files
+* parsing and normalizing article/product data
+* storing normalized records in a local database
+* building a fast and accurate article search index
+* exposing the functionality through a local web UI
+
+Default architectural priorities:
+
+1. Exact and prefix article search are more important than generic full-text search.
+
+2. Keep both original and normalized article values.
+
+3. Prefer deterministic normalization and deduplication.
+
+4. Prefer SQLite or another local embedded database unless the repo already uses something else.
+
+5. UI must support local file upload, import feedback, search, filters, and result details.
+
+6. All code changes must preserve local-first development and simple setup.
+
+7. For any library/framework setup or version-specific code generation, use Context7 when available.
+
+8. For complex architecture decomposition or ambiguous implementation tradeoffs, use Sequential Thinking when available.

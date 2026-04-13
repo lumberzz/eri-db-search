@@ -1,0 +1,179 @@
+:root {
+  font-family: "Segoe UI", system-ui, sans-serif;
+  line-height: 1.5;
+  color: #1a1a1a;
+  background: #f4f5f7;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+.layout {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+.header h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.5rem;
+}
+
+.muted {
+  color: #5c6370;
+  font-size: 0.9rem;
+}
+
+.card {
+  background: #fff;
+  border-radius: 8px;
+  padding: 1.25rem 1.5rem;
+  margin-top: 1rem;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+.card h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1.1rem;
+}
+
+.upload {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  padding: 0.5rem 0.75rem;
+  border: 1px dashed #c5cad3;
+  border-radius: 6px;
+  background: #fafbfc;
+}
+
+.upload input {
+  display: none;
+}
+
+.notice {
+  margin-top: 0.75rem;
+  padding: 0.5rem 0.75rem;
+  background: #eef6ff;
+  border-radius: 6px;
+  font-size: 0.9rem;
+}
+
+.stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  margin-top: 1rem;
+  font-size: 0.9rem;
+}
+
+.search-input {
+  width: 100%;
+  max-width: 480px;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid #c5cad3;
+  border-radius: 6px;
+  font-size: 1rem;
+}
+
+.error {
+  color: #b00020;
+  font-size: 0.9rem;
+}
+
+.split {
+  display: grid;
+  grid-template-columns: 1fr minmax(280px, 360px);
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+@media (max-width: 900px) {
+  .split {
+    grid-template-columns: 1fr;
+  }
+}
+
+.table-wrap {
+  overflow: auto;
+  max-height: 420px;
+  border: 1px solid #e2e5eb;
+  border-radius: 6px;
+}
+
+.results {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.results th,
+.results td {
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+  border-bottom: 1px solid #eef0f3;
+}
+
+.results tbody tr {
+  cursor: pointer;
+}
+
+.results tbody tr:hover {
+  background: #f7f8fa;
+}
+
+.results tbody tr.active {
+  background: #e8f2ff;
+}
+
+.mono {
+  font-family: ui-monospace, monospace;
+  font-size: 0.8rem;
+}
+
+.card-inner {
+  margin: 0;
+  padding: 1rem;
+  background: #fafbfc;
+  border-radius: 6px;
+  border: 1px solid #e2e5eb;
+  align-self: start;
+}
+
+.detail-body h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1rem;
+}
+
+.detail-body h4 {
+  margin: 1rem 0 0.35rem;
+  font-size: 0.9rem;
+}
+
+.detail-body dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  gap: 0.25rem 0.5rem;
+  font-size: 0.85rem;
+}
+
+.detail-body dt {
+  color: #5c6370;
+}
+
+.detail-body dd {
+  margin: 0;
+}
+
+.extra-list {
+  margin: 0;
+  padding-left: 1.1rem;
+  font-size: 0.85rem;
+}

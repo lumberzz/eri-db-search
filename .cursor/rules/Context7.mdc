@@ -1,0 +1,7 @@
+---
+alwaysApply: true
+---
+
+Always use Context7 when generating code that depends on external libraries,
+especially for Vite, React, SQLite, better-sqlite3, exceljs, xlsx, TanStack Table,
+and any import/parsing/configuration tasks.
