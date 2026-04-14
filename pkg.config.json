@@ -1,0 +1,9 @@
+{
+  "targets": ["node18-win-x64"],
+  "outputPath": "dist/win64",
+  "scripts": ["build/pkg/**/*.js"],
+  "assets": [
+    "client/dist/**/*",
+    "node_modules/better-sqlite3/build/Release/*.node"
+  ]
+}

@@ -9,9 +9,13 @@
     "dev": "concurrently -n server,client -c blue,green \"npm run dev -w server\" \"npm run dev -w client\"",
     "build": "npm run build -w server && npm run build -w client",
     "start": "npm run start -w server",
-    "sample:xlsx": "npm run sample:xlsx -w server"
+    "sample:xlsx": "npm run sample:xlsx -w server",
+    "package:prepare": "npm run build && node scripts/build-server-pkg.mjs && node scripts/prepare-win-package.mjs",
+    "package:win64": "npm run package:prepare && pkg -c pkg.config.json build/pkg/index.js --targets node18-win-x64 --output dist/win64/eri-db-search.exe --public-packages \"*\""
   },
   "devDependencies": {
-    "concurrently": "^9.1.2"
+    "concurrently": "^9.1.2",
+    "esbuild": "^0.25.9",
+    "pkg": "^5.8.1"
   }
 }

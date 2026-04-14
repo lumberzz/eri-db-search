@@ -3,12 +3,11 @@ import fs from "node:fs";
 import { exec } from "node:child_process";
 import express from "express";
 import cors from "cors";
-import { fileURLToPath } from "node:url";
 import { openDatabase } from "./db.js";
 import { apiRouter } from "./routes/api.js";
 import { resolveRuntimePaths } from "./runtimePaths.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// CJS-friendly entrypoint for packaging builds.
 const runtime = resolveRuntimePaths(__dirname);
 const startupLogPath = path.join(runtime.dataDir, "startup.log");
 

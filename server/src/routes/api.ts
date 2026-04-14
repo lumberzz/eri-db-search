@@ -9,7 +9,7 @@ import { createImportJobQueue } from "../services/importQueue.js";
 import { defaultFileProgress } from "../services/importProgress.js";
 import { getItemById, searchItems } from "../services/searchService.js";
 
-type ApiOpts = { repoRoot: string };
+type ApiOpts = { uploadRoot: string };
 
 function decodeOriginalFilename(name: string): string {
   try {
@@ -21,8 +21,7 @@ function decodeOriginalFilename(name: string): string {
   }
 }
 
-function ensureImportUploadRoot(repoRoot: string): string {
-  const root = path.join(repoRoot, "data", "uploads");
+function ensureImportUploadRoot(root: string): string {
   if (!fs.existsSync(root)) fs.mkdirSync(root, { recursive: true });
   return root;
 }
@@ -40,7 +39,7 @@ function assignImportJob(uploadRoot: string) {
 
 export function apiRouter(db: Database.Database, opts: ApiOpts): Router {
   const r = Router();
-  const uploadRoot = ensureImportUploadRoot(opts.repoRoot);
+  const uploadRoot = ensureImportUploadRoot(opts.uploadRoot);
   const importQueue = createImportJobQueue(db);
 
   const storage = multer.diskStorage({
