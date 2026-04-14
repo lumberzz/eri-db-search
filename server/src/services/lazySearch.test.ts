@@ -48,6 +48,8 @@ test("lazy exact search returns synthetic result", () => {
   assert.equal(out.length, 1);
   assert.equal(out[0]?.result_mode, "lazy");
   assert.equal(out[0]?.composite_art_normalized, compositeNormalizedKey("ER0100", "0001"));
+  assert.equal(out[0]?.source_filename, "f.xlsx");
+  assert.ok(String(out[0]?.source_sheet || "").startsWith("lazy/imported_files/"));
 
   db.close();
   fs.unlinkSync(p);

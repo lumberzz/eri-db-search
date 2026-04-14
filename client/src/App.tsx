@@ -135,6 +135,24 @@ export default function App() {
       setDetail(null);
       return;
     }
+    if (selected.result_mode === "lazy") {
+      setDetail({
+        id: selected.id,
+        composite_art: selected.composite_art,
+        base_art: selected.base_art,
+        add_art: selected.add_art,
+        display_name: selected.display_name,
+        base_name: selected.base_name,
+        add_name: selected.add_name,
+        source_filename: selected.source_filename,
+        source_sheet: selected.source_sheet,
+        source_row_base: selected.source_row_base,
+        source_row_add: selected.source_row_add,
+        import_job_id: selected.import_job_id,
+      });
+      setDetailState("idle");
+      return;
+    }
     setDetailState("loading");
     getItem(selected.id)
       .then((d) => {
@@ -158,6 +176,72 @@ export default function App() {
       </header>
 
       <section className="card">
+        <h2>Поиск</h2>
+        <input
+          className="search-input"
+          placeholder="Составной артикул (ER…-0001 или без дефиса)"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+        />
+        {searchState === "error" && (
+          <p className="error">Ошибка поиска. Проверьте, что API запущен.</p>
+        )}
+        {!q.trim() && <p className="muted">Введите запрос</p>}
+        {q.trim() && searchState === "loading" && (
+          <p className="muted">Поиск…</p>
+        )}
+        {q.trim() && searchState === "idle" && results.length === 0 && (
+          <p className="muted">Нет результатов</p>
+        )}
+        {results.length > 0 && (
+          <div className="split">
+            <div className="table-wrap">
+              <table className="results">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Ранг</th>
+                    <th>Режим</th>
+                    <th>Источник</th>
+                    <th>Составной</th>
+                    <th>Итоговое имя</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {results.map((row) => (
+                    <tr
+                      key={row.id}
+                      className={selected?.id === row.id ? "active" : ""}
+                      onClick={() => setSelected(row)}
+                    >
+                      <td>{row.id}</td>
+                      <td>{row.rank}</td>
+                      <td>{row.result_mode === "lazy" ? "lazy" : "mat"}</td>
+                      <td className="mono">{row.source_filename}</td>
+                      <td className="mono">{row.composite_art}</td>
+                      <td>{row.display_name || "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="detail card-inner">
+              {!selected && <p className="muted">Выберите строку</p>}
+              {selected && detailState === "loading" && (
+                <p className="muted">Загрузка карточки…</p>
+              )}
+              {selected && detailState === "error" && (
+                <p className="error">Не удалось загрузить запись</p>
+              )}
+              {selected && detail && detailState === "idle" && (
+                <ItemDetail data={detail} />
+              )}
+            </div>
+          </div>
+        )}
+      </section>
+
+      <section className="card card--import">
         <h2>Импорт Excel</h2>
         <label className="upload">
           <input
@@ -259,69 +343,6 @@ export default function App() {
         )}
       </section>
 
-      <section className="card">
-        <h2>Поиск</h2>
-        <input
-          className="search-input"
-          placeholder="Составной артикул (ER…-0001 или без дефиса)"
-          value={q}
-          onChange={(e) => setQ(e.target.value)}
-        />
-        {searchState === "error" && (
-          <p className="error">Ошибка поиска. Проверьте, что API запущен.</p>
-        )}
-        {!q.trim() && <p className="muted">Введите запрос</p>}
-        {q.trim() && searchState === "loading" && (
-          <p className="muted">Поиск…</p>
-        )}
-        {q.trim() && searchState === "idle" && results.length === 0 && (
-          <p className="muted">Нет результатов</p>
-        )}
-        {results.length > 0 && (
-          <div className="split">
-            <div className="table-wrap">
-              <table className="results">
-                <thead>
-                  <tr>
-                    <th>#</th>
-                    <th>Ранг</th>
-                    <th>Источник</th>
-                    <th>Составной</th>
-                    <th>Итоговое имя</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {results.map((row) => (
-                    <tr
-                      key={row.id}
-                      className={selected?.id === row.id ? "active" : ""}
-                      onClick={() => setSelected(row)}
-                    >
-                      <td>{row.id}</td>
-                      <td>{row.rank}</td>
-                      <td>{row.result_mode === "lazy" ? "lazy" : "mat"}</td>
-                      <td className="mono">{row.composite_art}</td>
-                      <td>{row.display_name || "—"}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <div className="detail card-inner">
-              {!selected && <p className="muted">Выберите строку</p>}
-              {selected && detailState === "loading" && (
-                <p className="muted">Загрузка карточки…</p>
-              )}
-              {selected && detailState === "error" && (
-                <p className="error">Не удалось загрузить запись</p>
-              )}
-              {selected && detail && detailState === "idle" && (
-                <ItemDetail data={detail} />
-              )}
-            </div>
-          </div>
-        )}
-      </section>
     </div>
   );
 }

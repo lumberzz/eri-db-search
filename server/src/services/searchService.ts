@@ -181,7 +181,8 @@ function buildLazyHit(
     source_filename: string;
     source_sheet: string;
     source_row: number;
-  }
+  },
+  source: { originalFilename: string; importedFileId: number; importJobId: string }
 ): SearchHit {
   return {
     id: -(b.id * 1_000_000 + a.id),
@@ -194,11 +195,11 @@ function buildLazyHit(
     display_name: `${b.base_name}, ${a.add_name}`,
     base_name: b.base_name,
     add_name: a.add_name,
-    source_filename: `${b.source_filename};${a.source_filename}`,
-    source_sheet: `${b.source_sheet}+${a.source_sheet}`,
+    source_filename: source.originalFilename,
+    source_sheet: `lazy/imported_files/${source.importedFileId}`,
     source_row_base: b.source_row,
     source_row_add: a.source_row,
-    import_job_id: "lazy",
+    import_job_id: source.importJobId || "lazy",
     created_at: "",
   };
 }
@@ -206,54 +207,75 @@ function buildLazyHit(
 function searchLazyExact(db: Database.Database, nq: string): SearchHit[] {
   const sp = splitCompositeFlat(nq);
   if (!sp) return [];
-  const b = db
+  const row = db
     .prepare(
-      `SELECT id, base_art, base_art_normalized, base_name, source_filename, source_sheet, source_row
-       FROM base_articles WHERE base_art_normalized = ? LIMIT 1`
+      `SELECT
+         b.id as b_id, b.base_art, b.base_art_normalized, b.base_name, b.source_filename as b_file, b.source_sheet as b_sheet, b.source_row as b_row,
+         a.id as a_id, a.add_art, a.add_art_normalized, a.add_name, a.source_filename as a_file, a.source_sheet as a_sheet, a.source_row as a_row,
+         f.id as imported_file_id, f.original_filename, f.import_job_id
+       FROM imported_files f
+       INNER JOIN import_file_bases fb ON fb.imported_file_id = f.id
+       INNER JOIN base_articles b ON b.id = fb.base_article_id
+       INNER JOIN import_file_adds fa ON fa.imported_file_id = f.id
+       INNER JOIN add_articles a ON a.id = fa.add_article_id
+       WHERE f.materialization_mode = 'lazy'
+         AND b.base_art_normalized = ?
+         AND a.add_art_normalized = ?
+       ORDER BY f.id DESC
+       LIMIT 1`
     )
-    .get(sp.er) as
+    .get(sp.er, sp.add) as
     | {
-        id: number;
+        b_id: number;
         base_art: string;
         base_art_normalized: string;
         base_name: string;
-        source_filename: string;
-        source_sheet: string;
-        source_row: number;
-      }
-    | undefined;
-  const a = db
-    .prepare(
-      `SELECT id, add_art, add_art_normalized, add_name, source_filename, source_sheet, source_row
-       FROM add_articles WHERE add_art_normalized = ? LIMIT 1`
-    )
-    .get(sp.add) as
-    | {
-        id: number;
+        b_file: string;
+        b_sheet: string;
+        b_row: number;
+        a_id: number;
         add_art: string;
         add_art_normalized: string;
         add_name: string;
-        source_filename: string;
-        source_sheet: string;
-        source_row: number;
+        a_file: string;
+        a_sheet: string;
+        a_row: number;
+        imported_file_id: number;
+        original_filename: string;
+        import_job_id: string;
       }
     | undefined;
-  if (!b || !a) return [];
-
-  const exists = db
-    .prepare(
-      `SELECT 1
-       FROM imported_files f
-       INNER JOIN import_file_bases fb ON fb.imported_file_id = f.id
-       INNER JOIN import_file_adds fa ON fa.imported_file_id = f.id
-       WHERE f.materialization_mode = 'lazy'
-         AND fb.base_article_id = ?
-         AND fa.add_article_id = ?
-       LIMIT 1`
-    )
-    .get(b.id, a.id);
-  if (!exists) return [];
-  return [{ ...buildLazyHit(b, a), rank: 1 }];
+  if (!row) return [];
+  return [
+    {
+      ...buildLazyHit(
+        {
+          id: row.b_id,
+          base_art: row.base_art,
+          base_art_normalized: row.base_art_normalized,
+          base_name: row.base_name,
+          source_filename: row.b_file,
+          source_sheet: row.b_sheet,
+          source_row: row.b_row,
+        },
+        {
+          id: row.a_id,
+          add_art: row.add_art,
+          add_art_normalized: row.add_art_normalized,
+          add_name: row.add_name,
+          source_filename: row.a_file,
+          source_sheet: row.a_sheet,
+          source_row: row.a_row,
+        },
+        {
+          originalFilename: row.original_filename,
+          importedFileId: row.imported_file_id,
+          importJobId: row.import_job_id,
+        }
+      ),
+      rank: 1,
+    },
+  ];
 }
 
 function splitLazyPrefixes(nq: string): { erPrefix: string; addPrefix: string } {
@@ -274,7 +296,8 @@ function searchLazyPrefix(
   const rows = db
     .prepare(
       `SELECT b.id as b_id, b.base_art, b.base_art_normalized, b.base_name, b.source_filename as b_file, b.source_sheet as b_sheet, b.source_row as b_row,
-              a.id as a_id, a.add_art, a.add_art_normalized, a.add_name, a.source_filename as a_file, a.source_sheet as a_sheet, a.source_row as a_row
+              a.id as a_id, a.add_art, a.add_art_normalized, a.add_name, a.source_filename as a_file, a.source_sheet as a_sheet, a.source_row as a_row,
+              f.id as imported_file_id, f.original_filename, f.import_job_id
        FROM imported_files f
        INNER JOIN import_file_bases fb ON fb.imported_file_id = f.id
        INNER JOIN base_articles b ON b.id = fb.base_article_id
@@ -283,6 +306,7 @@ function searchLazyPrefix(
        WHERE f.materialization_mode = 'lazy'
          AND b.base_art_normalized LIKE @bp
          AND a.add_art_normalized LIKE @ap
+       ORDER BY f.id DESC
        LIMIT @candidate`
     )
     .all({
@@ -304,6 +328,9 @@ function searchLazyPrefix(
     a_file: string;
     a_sheet: string;
     a_row: number;
+    imported_file_id: number;
+    original_filename: string;
+    import_job_id: string;
   }[];
   const out: SearchHit[] = [];
   const seen = new Set<string>();
@@ -331,6 +358,11 @@ function searchLazyPrefix(
           source_filename: r.a_file,
           source_sheet: r.a_sheet,
           source_row: r.a_row,
+        },
+        {
+          originalFilename: r.original_filename,
+          importedFileId: r.imported_file_id,
+          importJobId: r.import_job_id,
         }
       )
     );
