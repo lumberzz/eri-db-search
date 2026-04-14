@@ -8,14 +8,16 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "sample:xlsx": "tsx scripts/generate-sample-xlsx.ts",
-    "test": "tsx --test src/domain/erArticles.test.ts src/normalize.test.ts"
+    "test": "tsx --test src/domain/erArticles.test.ts src/normalize.test.ts src/services/searchCache.test.ts src/integration/dedupeAndDb.test.ts src/services/materializationPolicy.test.ts src/services/lazySearch.test.ts src/integration/lazyImportLargePolicy.test.ts",
+    "perf:smoke": "tsx scripts/perf-smoke.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.8.1",
     "cors": "^2.8.5",
     "exceljs": "^4.4.0",
     "express": "^4.21.2",
-    "multer": "^1.4.5-lts.1"
+    "multer": "^1.4.5-lts.1",
+    "p-queue": "^8.1.1"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",

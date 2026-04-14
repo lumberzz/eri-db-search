@@ -14,7 +14,7 @@ const dbPath = process.env.DATABASE_PATH
   ? path.isAbsolute(process.env.DATABASE_PATH)
     ? process.env.DATABASE_PATH
     : path.resolve(repoRoot, process.env.DATABASE_PATH)
-  : path.join(repoRoot, "data", "articles.sqlite");
+  : path.join(repoRoot, "data", "app.db");
 const clientDist = process.env.CLIENT_DIST
   ? path.isAbsolute(process.env.CLIENT_DIST)
     ? process.env.CLIENT_DIST
@@ -27,7 +27,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
-app.use("/api", apiRouter(db));
+app.use("/api", apiRouter(db, { repoRoot }));
 
 if (fs.existsSync(clientDist)) {
   app.use(express.static(clientDist));
