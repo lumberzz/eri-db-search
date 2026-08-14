@@ -118,6 +118,10 @@ CREATE TABLE IF NOT EXISTS imported_files (
 CREATE TABLE IF NOT EXISTS import_file_bases (
   imported_file_id INTEGER NOT NULL,
   base_article_id INTEGER NOT NULL,
+  file_base_art TEXT NOT NULL DEFAULT '',
+  file_base_name TEXT NOT NULL DEFAULT '',
+  source_sheet TEXT NOT NULL DEFAULT '',
+  source_row INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (imported_file_id, base_article_id),
   FOREIGN KEY (imported_file_id) REFERENCES imported_files(id) ON DELETE CASCADE,
@@ -127,9 +131,29 @@ CREATE TABLE IF NOT EXISTS import_file_bases (
 CREATE TABLE IF NOT EXISTS import_file_adds (
   imported_file_id INTEGER NOT NULL,
   add_article_id INTEGER NOT NULL,
+  file_add_art TEXT NOT NULL DEFAULT '',
+  file_add_name TEXT NOT NULL DEFAULT '',
+  source_sheet TEXT NOT NULL DEFAULT '',
+  source_row INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (imported_file_id, add_article_id),
   FOREIGN KEY (imported_file_id) REFERENCES imported_files(id) ON DELETE CASCADE,
+  FOREIGN KEY (add_article_id) REFERENCES add_articles(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS import_file_pairs (
+  imported_file_id INTEGER NOT NULL,
+  base_article_id INTEGER NOT NULL,
+  add_article_id INTEGER NOT NULL,
+  source_sheet TEXT NOT NULL,
+  source_row_base INTEGER NOT NULL,
+  source_row_add INTEGER NOT NULL,
+  pair_base_name TEXT NOT NULL DEFAULT '',
+  pair_add_name TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (imported_file_id, base_article_id, add_article_id),
+  FOREIGN KEY (imported_file_id) REFERENCES imported_files(id) ON DELETE CASCADE,
+  FOREIGN KEY (base_article_id) REFERENCES base_articles(id) ON DELETE CASCADE,
   FOREIGN KEY (add_article_id) REFERENCES add_articles(id) ON DELETE CASCADE
 );
 
@@ -143,6 +167,8 @@ CREATE INDEX IF NOT EXISTS idx_imported_files_fingerprint ON imported_files(fing
 CREATE INDEX IF NOT EXISTS idx_imported_files_mode ON imported_files(materialization_mode);
 CREATE INDEX IF NOT EXISTS idx_ifb_base_id ON import_file_bases(base_article_id);
 CREATE INDEX IF NOT EXISTS idx_ifa_add_id ON import_file_adds(add_article_id);
+CREATE INDEX IF NOT EXISTS idx_ifp_base_id ON import_file_pairs(base_article_id);
+CREATE INDEX IF NOT EXISTS idx_ifp_add_id ON import_file_pairs(add_article_id);
 `;
 
 function migrateLegacyImportJobs(db: Database.Database): void {
@@ -272,6 +298,133 @@ function migrateLazyMembershipV3(db: Database.Database): void {
   db.pragma("user_version = 3");
 }
 
+function migrateFilePairsV4(db: Database.Database): void {
+  const v = db.pragma("user_version", { simple: true }) as number;
+  if (v >= 4) return;
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS import_file_pairs (
+      imported_file_id INTEGER NOT NULL,
+      base_article_id INTEGER NOT NULL,
+      add_article_id INTEGER NOT NULL,
+      source_sheet TEXT NOT NULL,
+      source_row_base INTEGER NOT NULL,
+      source_row_add INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (imported_file_id, base_article_id, add_article_id),
+      FOREIGN KEY (imported_file_id) REFERENCES imported_files(id) ON DELETE CASCADE,
+      FOREIGN KEY (base_article_id) REFERENCES base_articles(id) ON DELETE CASCADE,
+      FOREIGN KEY (add_article_id) REFERENCES add_articles(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_ifp_base_id ON import_file_pairs(base_article_id);
+    CREATE INDEX IF NOT EXISTS idx_ifp_add_id ON import_file_pairs(add_article_id);
+  `);
+  db.pragma("user_version = 4");
+}
+
+function migratePairNamesV5(db: Database.Database): void {
+  const v = db.pragma("user_version", { simple: true }) as number;
+  if (v >= 5) return;
+  const cols = db.prepare(`PRAGMA table_info(import_file_pairs)`).all() as { name: string }[];
+  const names = new Set(cols.map((c) => c.name));
+  if (!names.has("pair_base_name")) {
+    db.exec(`ALTER TABLE import_file_pairs ADD COLUMN pair_base_name TEXT NOT NULL DEFAULT '';`);
+  }
+  if (!names.has("pair_add_name")) {
+    db.exec(`ALTER TABLE import_file_pairs ADD COLUMN pair_add_name TEXT NOT NULL DEFAULT '';`);
+  }
+  db.exec(`
+    UPDATE import_file_pairs
+    SET
+      pair_base_name = COALESCE((
+        SELECT b.base_name FROM base_articles b WHERE b.id = import_file_pairs.base_article_id
+      ), ''),
+      pair_add_name = COALESCE((
+        SELECT a.add_name FROM add_articles a WHERE a.id = import_file_pairs.add_article_id
+      ), '')
+    WHERE pair_base_name = '' OR pair_add_name = '';
+  `);
+  db.pragma("user_version = 5");
+}
+
+function migrateFileLocalMembershipV6(db: Database.Database): void {
+  const v = db.pragma("user_version", { simple: true }) as number;
+  if (v >= 6) return;
+
+  const ensureColumns = (
+    table: string,
+    columns: { name: string; sql: string }[]
+  ) => {
+    const existing = db.prepare(`PRAGMA table_info(${table})`).all() as {
+      name: string;
+    }[];
+    const names = new Set(existing.map((column) => column.name));
+    for (const column of columns) {
+      if (!names.has(column.name)) {
+        db.exec(`ALTER TABLE ${table} ADD COLUMN ${column.sql};`);
+      }
+    }
+  };
+
+  ensureColumns("import_file_bases", [
+    { name: "file_base_art", sql: "file_base_art TEXT NOT NULL DEFAULT ''" },
+    { name: "file_base_name", sql: "file_base_name TEXT NOT NULL DEFAULT ''" },
+    { name: "source_sheet", sql: "source_sheet TEXT NOT NULL DEFAULT ''" },
+    { name: "source_row", sql: "source_row INTEGER NOT NULL DEFAULT 0" },
+  ]);
+  ensureColumns("import_file_adds", [
+    { name: "file_add_art", sql: "file_add_art TEXT NOT NULL DEFAULT ''" },
+    { name: "file_add_name", sql: "file_add_name TEXT NOT NULL DEFAULT ''" },
+    { name: "source_sheet", sql: "source_sheet TEXT NOT NULL DEFAULT ''" },
+    { name: "source_row", sql: "source_row INTEGER NOT NULL DEFAULT 0" },
+  ]);
+
+  // Existing lazy memberships predate file-local metadata. Preserve search
+  // capability by backfilling from the canonical rows; a fresh re-import will
+  // replace these values with exact file-local names and row numbers.
+  db.exec(`
+    UPDATE import_file_bases
+    SET
+      file_base_art = COALESCE((
+        SELECT b.base_art FROM base_articles b
+        WHERE b.id = import_file_bases.base_article_id
+      ), ''),
+      file_base_name = COALESCE((
+        SELECT b.base_name FROM base_articles b
+        WHERE b.id = import_file_bases.base_article_id
+      ), ''),
+      source_sheet = COALESCE((
+        SELECT b.source_sheet FROM base_articles b
+        WHERE b.id = import_file_bases.base_article_id
+      ), ''),
+      source_row = COALESCE((
+        SELECT b.source_row FROM base_articles b
+        WHERE b.id = import_file_bases.base_article_id
+      ), 0)
+    WHERE file_base_art = '';
+
+    UPDATE import_file_adds
+    SET
+      file_add_art = COALESCE((
+        SELECT a.add_art FROM add_articles a
+        WHERE a.id = import_file_adds.add_article_id
+      ), ''),
+      file_add_name = COALESCE((
+        SELECT a.add_name FROM add_articles a
+        WHERE a.id = import_file_adds.add_article_id
+      ), ''),
+      source_sheet = COALESCE((
+        SELECT a.source_sheet FROM add_articles a
+        WHERE a.id = import_file_adds.add_article_id
+      ), ''),
+      source_row = COALESCE((
+        SELECT a.source_row FROM add_articles a
+        WHERE a.id = import_file_adds.add_article_id
+      ), 0)
+    WHERE file_add_art = '';
+  `);
+  db.pragma("user_version = 6");
+}
+
 function ensureIndexesFreshInstall(db: Database.Database): void {
   const row = db
     .prepare(`SELECT 1 FROM sqlite_master WHERE type='index' AND name='ux_base_art_normalized'`)
@@ -310,6 +463,9 @@ export function openDatabase(dbPath: string): Database.Database {
   migrateLegacyImportJobs(db);
   migrateGlobalDedupeV2(db);
   migrateLazyMembershipV3(db);
+  migrateFilePairsV4(db);
+  migratePairNamesV5(db);
+  migrateFileLocalMembershipV6(db);
   ensureIndexesFreshInstall(db);
   applyPerformancePragmas(db);
   return db;

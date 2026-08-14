@@ -6,14 +6,18 @@ import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import { performance } from "node:perf_hooks";
 import { mergeDisplayName } from "../domain/erArticles.js";
+import {
+  FileCombinationCollector,
+  type FileAddArticle,
+  type FileArticlePair,
+  type FileBaseArticle,
+} from "../domain/filePairs.js";
 import { parseXlsxFileStream } from "../ingest/parseWorkbookStream.js";
 import type { ParsedAddRow, ParsedBaseRow } from "../ingest/parseWorkbook.js";
 import { compositeNormalizedKey, normalizeArticle } from "../normalize.js";
 import {
   VARIANT_INSERT_BATCH,
   ROW_PARSE_YIELD_EVERY,
-  BASE_ARTICLE_PAGE,
-  ADD_ARTICLE_PAGE,
   MATERIALIZE_WARN_PAIRS,
   MATERIALIZE_LAZY_PAIRS,
   MATERIALIZE_REJECT_PAIRS,
@@ -66,22 +70,30 @@ export type ImportJobResult = {
   diagnostics?: Record<string, number | string>;
 };
 
+const IMPORT_CACHE_VERSION = 2;
+
 function parseCachedFileSummary(
   raw: string
-): { sheets: ImportFileSummary["sheets"]; totals: Partial<ImportJobResult["totals"]> } {
+): {
+  version: number;
+  sheets: ImportFileSummary["sheets"];
+  totals: Partial<ImportJobResult["totals"]>;
+} {
   try {
     const parsed = JSON.parse(raw) as
       | {
+          version?: number;
           sheets?: ImportFileSummary["sheets"];
           totals?: Partial<ImportJobResult["totals"]>;
         }
       | null;
     return {
+      version: parsed?.version ?? 0,
       sheets: Array.isArray(parsed?.sheets) ? parsed.sheets : [],
       totals: parsed?.totals ?? {},
     };
   } catch {
-    return { sheets: [], totals: {} };
+    return { version: 0, sheets: [], totals: {} };
   }
 }
 
@@ -154,37 +166,111 @@ function upsertAdd(db: Database.Database, row: ParsedAddRow, jobId: string): boo
   return r.changes > 0;
 }
 
-type UniqAdd = {
-  id: number;
-  add_art: string;
-  add_name: string;
-  add_art_normalized: string;
-  source_sheet: string;
-  source_row: number;
-};
-
-type BaseRow = {
-  id: number;
+type VariantInsertRow = {
+  base_article_id: number;
+  add_article_id: number;
   base_art: string;
+  add_art: string;
+  composite_art_original: string;
+  composite_art_normalized: string;
   base_name: string;
+  add_name: string;
+  display_name: string;
+  source_filename: string;
   source_sheet: string;
-  source_row: number;
+  source_row_base: number;
+  source_row_add: number;
+  import_job_id: string;
 };
 
-function fillTempNorms(
+function clearVariantsForSourceFile(db: Database.Database, filename: string): void {
+  const rows = db
+    .prepare(`SELECT id FROM search_variants WHERE source_filename = ?`)
+    .all(filename) as { id: number }[];
+  if (rows.length === 0) return;
+  const delFts = db.prepare(
+    `INSERT INTO search_variants_fts(search_variants_fts, rowid, composite_art_normalized, display_name, base_name, add_name)
+     VALUES ('delete', ?, '', '', '', '')`
+  );
+  const del = db.transaction((ids: number[]) => {
+    for (const id of ids) delFts.run(id);
+    db.prepare(`DELETE FROM search_variants WHERE source_filename = ?`).run(filename);
+  });
+  del(rows.map((r) => r.id));
+}
+
+function clearImportedFileMembership(
   db: Database.Database,
-  bases: Set<string>,
-  adds: Set<string>
+  filename: string
 ): void {
-  db.exec(`
-    CREATE TEMP TABLE IF NOT EXISTS _imp_file_bases (norm TEXT PRIMARY KEY);
-    CREATE TEMP TABLE IF NOT EXISTS _imp_file_adds (norm TEXT PRIMARY KEY);
-  `);
-  db.exec(`DELETE FROM _imp_file_bases; DELETE FROM _imp_file_adds;`);
-  const ib = db.prepare(`INSERT OR IGNORE INTO _imp_file_bases (norm) VALUES (?)`);
-  const ia = db.prepare(`INSERT OR IGNORE INTO _imp_file_adds (norm) VALUES (?)`);
-  for (const n of bases) ib.run(n);
-  for (const n of adds) ia.run(n);
+  db.prepare(`DELETE FROM imported_files WHERE original_filename = ?`).run(
+    filename
+  );
+}
+
+function upsertSearchVariant(
+  db: Database.Database,
+  row: VariantInsertRow
+): "inserted" | "updated" | "skipped" {
+  const existing = db
+    .prepare(`SELECT id FROM search_variants WHERE composite_art_normalized = ?`)
+    .get(row.composite_art_normalized) as { id: number } | undefined;
+
+  if (!existing) {
+    const info = db
+      .prepare(
+        `INSERT INTO search_variants (
+          base_article_id, add_article_id,
+          base_art, add_art,
+          composite_art_original, composite_art_normalized,
+          base_name, add_name, display_name,
+          source_filename, source_sheet, source_row_base, source_row_add,
+          import_job_id
+        ) VALUES (
+          @base_article_id, @add_article_id,
+          @base_art, @add_art,
+          @composite_art_original, @composite_art_normalized,
+          @base_name, @add_name, @display_name,
+          @source_filename, @source_sheet, @source_row_base, @source_row_add,
+          @import_job_id
+        )`
+      )
+      .run(row);
+    const rowid = Number(info.lastInsertRowid);
+    db.prepare(
+      `INSERT INTO search_variants_fts (rowid, composite_art_normalized, display_name, base_name, add_name)
+       VALUES (?,?,?,?,?)`
+    ).run(rowid, row.composite_art_normalized, row.display_name, row.base_name, row.add_name);
+    return "inserted";
+  }
+
+  db.prepare(
+    `UPDATE search_variants SET
+      base_article_id = @base_article_id,
+      add_article_id = @add_article_id,
+      base_art = @base_art,
+      add_art = @add_art,
+      composite_art_original = @composite_art_original,
+      base_name = @base_name,
+      add_name = @add_name,
+      display_name = @display_name,
+      source_filename = @source_filename,
+      source_sheet = @source_sheet,
+      source_row_base = @source_row_base,
+      source_row_add = @source_row_add,
+      import_job_id = @import_job_id
+    WHERE id = @id`
+  ).run({ ...row, id: existing.id });
+
+  db.prepare(
+    `INSERT INTO search_variants_fts(search_variants_fts, rowid, composite_art_normalized, display_name, base_name, add_name)
+     VALUES ('delete', ?, '', '', '', '')`
+  ).run(existing.id);
+  db.prepare(
+    `INSERT INTO search_variants_fts (rowid, composite_art_normalized, display_name, base_name, add_name)
+     VALUES (?,?,?,?,?)`
+  ).run(existing.id, row.composite_art_normalized, row.display_name, row.base_name, row.add_name);
+  return "updated";
 }
 
 function registerImportedFileAndMembership(
@@ -199,8 +285,8 @@ function registerImportedFileAndMembership(
     uniqueAdds: number;
     estimatedPairs: number;
     warnings: string[];
-    baseNorms: Set<string>;
-    addNorms: Set<string>;
+    bases: FileBaseArticle[];
+    adds: FileAddArticle[];
   }
 ): void {
   const insFile = db.prepare(
@@ -224,168 +310,113 @@ function registerImportedFileAndMembership(
   );
   if (importedFileId <= 0) return;
 
-  fillTempNorms(db, args.baseNorms, args.addNorms);
-  db.prepare(
-    `INSERT OR IGNORE INTO import_file_bases (imported_file_id, base_article_id)
-     SELECT ?, b.id FROM base_articles b
-     INNER JOIN _imp_file_bases t ON b.base_art_normalized = t.norm`
-  ).run(importedFileId);
-  db.prepare(
-    `INSERT OR IGNORE INTO import_file_adds (imported_file_id, add_article_id)
-     SELECT ?, a.id FROM add_articles a
-     INNER JOIN _imp_file_adds t ON a.add_art_normalized = t.norm`
-  ).run(importedFileId);
+  const insertBaseMembership = db.prepare(
+    `INSERT OR REPLACE INTO import_file_bases (
+      imported_file_id, base_article_id, file_base_art, file_base_name,
+      source_sheet, source_row
+    )
+    SELECT ?, b.id, ?, ?, ?, ?
+    FROM base_articles b
+    WHERE b.base_art_normalized = ?`
+  );
+  for (const base of args.bases) {
+    insertBaseMembership.run(
+      importedFileId,
+      base.baseArt.trim(),
+      base.baseName.trim(),
+      base.sourceSheet,
+      base.sourceRow,
+      base.baseNorm
+    );
+  }
+
+  const insertAddMembership = db.prepare(
+    `INSERT OR REPLACE INTO import_file_adds (
+      imported_file_id, add_article_id, file_add_art, file_add_name,
+      source_sheet, source_row
+    )
+    SELECT ?, a.id, ?, ?, ?, ?
+    FROM add_articles a
+    WHERE a.add_art_normalized = ?`
+  );
+  for (const add of args.adds) {
+    insertAddMembership.run(
+      importedFileId,
+      add.addArt.trim(),
+      add.addName,
+      add.sourceSheet,
+      add.sourceRow,
+      add.addNorm
+    );
+  }
 }
 
 export function materializeVariantsChunked(
   db: Database.Database,
   jobId: string,
   filename: string,
-  baseNorms: Set<string>,
-  addNorms: Set<string>,
+  pairs: FileArticlePair[],
   onChunk: (written: number, skipped: number, totalPairsProcessed: number) => void
 ): { inserted: number; skipped: number } {
-  if (baseNorms.size === 0 || addNorms.size === 0) {
+  if (pairs.length === 0) {
     return { inserted: 0, skipped: 0 };
   }
 
-  fillTempNorms(db, baseNorms, addNorms);
-
-  const insertVar = db.prepare(
-    `INSERT INTO search_variants (
-      base_article_id, add_article_id,
-      base_art, add_art,
-      composite_art_original, composite_art_normalized,
-      base_name, add_name, display_name,
-      source_filename, source_sheet, source_row_base, source_row_add,
-      import_job_id
-    ) VALUES (
-      @base_article_id, @add_article_id,
-      @base_art, @add_art,
-      @composite_art_original, @composite_art_normalized,
-      @base_name, @add_name, @display_name,
-      @source_filename, @source_sheet, @source_row_base, @source_row_add,
-      @import_job_id
-    )
-    ON CONFLICT(composite_art_normalized) DO NOTHING`
+  const lookupBase = db.prepare(
+    `SELECT id, base_art FROM base_articles WHERE base_art_normalized = ?`
   );
-
-  const insertFts = db.prepare(
-    `INSERT INTO search_variants_fts (rowid, composite_art_normalized, display_name, base_name, add_name)
-     VALUES (?,?,?,?,?)`
-  );
-
-  const stmtBasesPage = db.prepare(
-    `SELECT b.id, b.base_art, b.base_name, b.source_sheet, b.source_row
-     FROM base_articles b
-     INNER JOIN _imp_file_bases t ON b.base_art_normalized = t.norm
-     WHERE b.id > ?
-     ORDER BY b.id
-     LIMIT ?`
-  );
-
-  const stmtAddsPage = db.prepare(
-    `SELECT a.id, a.add_art, a.add_name, a.add_art_normalized, a.source_sheet, a.source_row
-     FROM add_articles a
-     INNER JOIN _imp_file_adds t ON a.add_art_normalized = t.norm
-     WHERE a.id > ?
-     ORDER BY a.id
-     LIMIT ?`
+  const lookupAdd = db.prepare(
+    `SELECT id, add_art FROM add_articles WHERE add_art_normalized = ?`
   );
 
   let inserted = 0;
   let skipped = 0;
   let pairsProcessed = 0;
-  let lastBaseId = 0;
 
-  while (true) {
-    const bases = stmtBasesPage.all(lastBaseId, BASE_ARTICLE_PAGE) as BaseRow[];
-    if (bases.length === 0) break;
+  const flushBatch = db.transaction((batch: VariantInsertRow[]) => {
+    for (const p of batch) {
+      const result = upsertSearchVariant(db, p);
+      if (result === "inserted") inserted += 1;
+      else if (result === "updated") inserted += 1;
+      else skipped += 1;
+    }
+  });
 
-    const flushBatch = db.transaction(
-      (
-        batch: {
-          base_article_id: number;
-          add_article_id: number;
-          base_art: string;
-          add_art: string;
-          composite_art_original: string;
-          composite_art_normalized: string;
-          base_name: string;
-          add_name: string;
-          display_name: string;
-          source_filename: string;
-          source_sheet: string;
-          source_row_base: number;
-          source_row_add: number;
-          import_job_id: string;
-        }[]
-      ) => {
-        for (const p of batch) {
-          const info = insertVar.run(p);
-          if (info.changes > 0) {
-            insertFts.run(
-              Number(info.lastInsertRowid),
-              p.composite_art_normalized,
-              p.display_name,
-              p.base_name,
-              p.add_name
-            );
-            inserted += 1;
-          } else {
-            skipped += 1;
-          }
-        }
-      }
-    );
+  for (let i = 0; i < pairs.length; i += VARIANT_INSERT_BATCH) {
+    const slice = pairs.slice(i, i + VARIANT_INSERT_BATCH);
+    const acc: VariantInsertRow[] = [];
 
-    let lastAddId = 0;
-    for (;;) {
-      const adds = stmtAddsPage.all(lastAddId, ADD_ARTICLE_PAGE) as UniqAdd[];
-      if (adds.length === 0) break;
+    for (const pair of slice) {
+      const b = lookupBase.get(pair.baseNorm) as
+        | { id: number; base_art: string }
+        | undefined;
+      const a = lookupAdd.get(pair.addNorm) as
+        | { id: number; add_art: string }
+        | undefined;
+      if (!b || !a) continue;
 
-      let acc: Parameters<typeof flushBatch>[0] = [];
-
-      for (const b of bases) {
-        for (const a of adds) {
-          const compositeOriginal = `${b.base_art}-${a.add_art}`;
-          const compositeNorm = compositeNormalizedKey(b.base_art, a.add_art);
-          const displayName = mergeDisplayName(b.base_name, a.add_name);
-          acc.push({
-            base_article_id: b.id,
-            add_article_id: a.id,
-            base_art: b.base_art,
-            add_art: a.add_art,
-            composite_art_original: compositeOriginal,
-            composite_art_normalized: compositeNorm,
-            base_name: b.base_name,
-            add_name: a.add_name,
-            display_name: displayName,
-            source_filename: filename,
-            source_sheet: `${b.source_sheet} + ${a.source_sheet}`,
-            source_row_base: b.source_row,
-            source_row_add: a.source_row,
-            import_job_id: jobId,
-          });
-          pairsProcessed += 1;
-
-          if (acc.length >= VARIANT_INSERT_BATCH) {
-            flushBatch(acc);
-            acc = [];
-            onChunk(inserted, skipped, pairsProcessed);
-          }
-        }
-      }
-
-      if (acc.length > 0) {
-        flushBatch(acc);
-        onChunk(inserted, skipped, pairsProcessed);
-      }
-
-      lastAddId = adds[adds.length - 1]!.id;
+      acc.push({
+        base_article_id: b.id,
+        add_article_id: a.id,
+        base_art: pair.baseArt,
+        add_art: pair.addArt,
+        composite_art_original: `${pair.baseArt}-${pair.addArt}`,
+        composite_art_normalized: compositeNormalizedKey(pair.baseArt, pair.addArt),
+        base_name: pair.baseName,
+        add_name: pair.addName,
+        display_name: mergeDisplayName(pair.baseName, pair.addName),
+        source_filename: filename,
+        source_sheet: pair.sourceSheet,
+        source_row_base: pair.sourceRowBase,
+        source_row_add: pair.sourceRowAdd,
+        import_job_id: jobId,
+      });
+      pairsProcessed += 1;
     }
 
-    lastBaseId = bases[bases.length - 1]!.id;
+    if (acc.length > 0) {
+      flushBatch(acc);
+    }
     onChunk(inserted, skipped, pairsProcessed);
   }
 
@@ -486,41 +517,45 @@ export async function runImportJob(
           | undefined;
         if (cached) {
           const s = parseCachedFileSummary(cached.summary_json);
-          cacheHits += 1;
-          rowsRead += s.totals?.rowsRead ?? 0;
-          rowsSkipped += s.totals?.rowsSkipped ?? 0;
-          errorsLogged += s.totals?.errorsLogged ?? 0;
-          basesInserted += s.totals?.basesInserted ?? 0;
-          basesSkipped += s.totals?.basesSkipped ?? 0;
-          addsInserted += s.totals?.addsInserted ?? 0;
-          addsSkipped += s.totals?.addsSkipped ?? 0;
-          variantsInserted += s.totals?.variantsInserted ?? 0;
-          variantsSkipped += s.totals?.variantsSkipped ?? 0;
-          fileSummaries.push({
-            filename: logicalName,
-            fingerprint,
-            cacheHit: true,
-            duplicateFile: true,
-            sheets: s.sheets || [],
-          });
-          patchJobFile(db, jobId, fileIndex, {
-            status: "already_imported",
-            percent: 100,
-            message:
-              "Файл уже импортирован (тот же fingerprint). Повторная обработка не требуется.",
-            rowsProcessed: s.totals?.rowsRead ?? 0,
-            rowsTotal: s.totals?.rowsRead ?? 0,
-            basesFound: s.totals?.basesInserted ?? 0,
-            addsFound: s.totals?.addsInserted ?? 0,
-            variantsInserted: s.totals?.variantsInserted ?? 0,
-            variantsSkipped: s.totals?.variantsSkipped ?? 0,
-          });
-          continue;
+          if (s.version === IMPORT_CACHE_VERSION) {
+            cacheHits += 1;
+            rowsRead += s.totals?.rowsRead ?? 0;
+            rowsSkipped += s.totals?.rowsSkipped ?? 0;
+            errorsLogged += s.totals?.errorsLogged ?? 0;
+            basesInserted += s.totals?.basesInserted ?? 0;
+            basesSkipped += s.totals?.basesSkipped ?? 0;
+            addsInserted += s.totals?.addsInserted ?? 0;
+            addsSkipped += s.totals?.addsSkipped ?? 0;
+            variantsInserted += s.totals?.variantsInserted ?? 0;
+            variantsSkipped += s.totals?.variantsSkipped ?? 0;
+            fileSummaries.push({
+              filename: logicalName,
+              fingerprint,
+              cacheHit: true,
+              duplicateFile: true,
+              sheets: s.sheets || [],
+            });
+            patchJobFile(db, jobId, fileIndex, {
+              status: "already_imported",
+              percent: 100,
+              message:
+                "Файл уже импортирован (тот же fingerprint). Повторная обработка не требуется.",
+              rowsProcessed: s.totals?.rowsRead ?? 0,
+              rowsTotal: s.totals?.rowsRead ?? 0,
+              basesFound: s.totals?.basesInserted ?? 0,
+              addsFound: s.totals?.addsInserted ?? 0,
+              variantsInserted: s.totals?.variantsInserted ?? 0,
+              variantsSkipped: s.totals?.variantsSkipped ?? 0,
+            });
+            continue;
+          }
         }
       }
 
-      const baseNormsThisFile = new Set<string>();
-      const addNormsThisFile = new Set<string>();
+      clearVariantsForSourceFile(db, logicalName);
+      clearImportedFileMembership(db, logicalName);
+
+      const combinationCollector = new FileCombinationCollector();
       let parseRows = 0;
       let parseBases = 0;
       let parseAdds = 0;
@@ -534,10 +569,10 @@ export async function runImportJob(
         patchJobFile(db, jobId, fileIndex, {
           status: "parsing",
           rowsProcessed: parseRows,
-          basesFound: baseNormsThisFile.size,
-          addsFound: addNormsThisFile.size,
+          basesFound: combinationCollector.baseRows().length,
+          addsFound: combinationCollector.addRows().length,
           percent: 7,
-          message: `Разбор строк: ${parseRows}; баз (уник.): ${baseNormsThisFile.size}; добавок (уник.): ${addNormsThisFile.size}`,
+          message: `Разбор строк: ${parseRows}; баз (уник.): ${combinationCollector.baseRows().length}; добавок (уник.): ${combinationCollector.addRows().length}; комбинаций: ${combinationCollector.estimatedPairs}`,
         });
       };
 
@@ -562,8 +597,7 @@ export async function runImportJob(
               return;
             }
             if (ev.type === "base") {
-              const norm = normalizeArticle(ev.row.baseArt);
-              baseNormsThisFile.add(norm);
+              combinationCollector.onBase(ev.row);
               parseRows += 1;
               parseBases += 1;
               if (upsertBase(db, ev.row, jobId)) {
@@ -574,8 +608,7 @@ export async function runImportJob(
                 fileBasesSkipped += 1;
               }
             } else if (ev.type === "add") {
-              const norm = normalizeArticle(ev.row.addArt);
-              addNormsThisFile.add(norm);
+              combinationCollector.onAdd(ev.row);
               parseRows += 1;
               parseAdds += 1;
               if (upsertAdd(db, ev.row, jobId)) {
@@ -602,8 +635,8 @@ export async function runImportJob(
         percent: 40,
         rowsProcessed: parseRows,
         rowsTotal,
-        basesFound: baseNormsThisFile.size,
-        addsFound: addNormsThisFile.size,
+        basesFound: combinationCollector.baseRows().length,
+        addsFound: combinationCollector.addRows().length,
         message: "Парсинг завершён",
       });
 
@@ -623,10 +656,12 @@ export async function runImportJob(
         });
       }
 
-      const variantPairTotal = baseNormsThisFile.size * addNormsThisFile.size;
+      const fileBases = combinationCollector.baseRows();
+      const fileAdds = combinationCollector.addRows();
+      const variantPairTotal = combinationCollector.estimatedPairs;
       const decision = decideMaterializationMode(
-        baseNormsThisFile.size,
-        addNormsThisFile.size,
+        fileBases.length,
+        fileAdds.length,
         variantPairTotal,
         options.policyOverride ?? {
           warnPairs: MATERIALIZE_WARN_PAIRS,
@@ -655,15 +690,15 @@ export async function runImportJob(
           variantPairsTotal: variantPairTotal,
           variantPairsProcessed: 0,
           message:
-            "Генерация составных артикулов (декартово произведение уникальных баз × добавок файла)",
+            "Генерация составных артикулов (все базы × все добавочные коды файла)",
         });
         const tVar0 = performance.now();
+        const filePairs = combinationCollector.pairs();
         const out = materializeVariantsChunked(
           db,
           jobId,
           logicalName,
-          baseNormsThisFile,
-          addNormsThisFile,
+          filePairs,
           (ins, sk, proc) => {
             patchJobFile(db, jobId, fileIndex, {
               status: "generating_variants",
@@ -697,12 +732,12 @@ export async function runImportJob(
         fingerprint,
         byteSize,
         mode: decision.mode,
-        uniqueBases: baseNormsThisFile.size,
-        uniqueAdds: addNormsThisFile.size,
+        uniqueBases: fileBases.length,
+        uniqueAdds: fileAdds.length,
         estimatedPairs: variantPairTotal,
         warnings: decision.warnings,
-        baseNorms: baseNormsThisFile,
-        addNorms: addNormsThisFile,
+        bases: fileBases,
+        adds: fileAdds,
       });
 
       const fileSummary: ImportFileSummary = {
@@ -710,8 +745,8 @@ export async function runImportJob(
         fingerprint,
         cacheHit: false,
         materializationMode: decision.mode,
-        uniqueBases: baseNormsThisFile.size,
-        uniqueAdds: addNormsThisFile.size,
+        uniqueBases: fileBases.length,
+        uniqueAdds: fileAdds.length,
         estimatedPairs: variantPairTotal,
         warnings: decision.warnings,
         sheets: sheetSummaries,
@@ -723,6 +758,7 @@ export async function runImportJob(
         original_filename: logicalName,
         byte_size: byteSize,
         summary_json: JSON.stringify({
+          version: IMPORT_CACHE_VERSION,
           sheets: sheetSummaries,
           totals: {
             rowsRead: sheetAcc.reduce((a, s) => a + s.rowsRead, 0),

@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 import { collapseSpaces, normalizeCompositeSearchInput } from "../normalize.js";
+import { mergeDisplayName } from "../domain/erArticles.js";
 import type { SearchHit } from "../types/searchHit.js";
 import {
   currentSearchCacheGeneration,
@@ -10,6 +11,12 @@ import {
   LAZY_SEARCH_CANDIDATE_LIMIT,
   LAZY_SEARCH_SCOPE_LIMIT,
 } from "../config.js";
+import {
+  normalizeSearchText,
+  parseSearchQuery,
+  splitCompositeFromQuery,
+  type ParsedSearchQuery,
+} from "./searchQueryParse.js";
 
 export type { SearchHit };
 
@@ -17,25 +24,13 @@ function escapeLike(s: string): string {
   return s.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
 }
 
-/** Убрать все пробельные символы, верхний регистр — для сравнения «как напечатали» с дефисом. */
 function compactUpperNoSpace(s: string): string {
   return collapseSpaces(s).toUpperCase().replace(/\s/g, "");
 }
 
-/** Разбор плоского ключа ER… + 4 цифры для FTS. */
-function splitCompositeFlat(flat: string): { er: string; add: string } | null {
-  if (flat.length < 6 || !flat.startsWith("ER")) return null;
-  const add = flat.slice(-4);
-  if (!/^\d{4}$/.test(add)) return null;
-  const er = flat.slice(0, -4);
-  if (er.length < 3 || !er.startsWith("ER")) return null;
-  return { er, add };
-}
-
-function ftsQueryFromUserInput(raw: string): string | null {
-  const flat = normalizeCompositeSearchInput(raw);
+function ftsQueryFromUserInput(raw: string, flat: string): string | null {
   if (flat.length < 8) return null;
-  const sp = splitCompositeFlat(flat);
+  const sp = splitCompositeFromQuery(raw, flat);
   if (sp) {
     return `"${sp.er}"* AND "${sp.add}"*`;
   }
@@ -46,8 +41,44 @@ function ftsQueryFromUserInput(raw: string): string | null {
 }
 
 function searchCacheKey(query: string, limit: number): string {
-  const nq = normalizeCompositeSearchInput(query.trim());
-  return `${nq}\0${limit}`;
+  return `${normalizeSearchText(query)}\0${limit}`;
+}
+
+function mapSvRow(r: {
+  id: number;
+  rank: number;
+  composite_art_original: string;
+  composite_art_normalized: string;
+  base_art: string;
+  add_art: string;
+  display_name: string;
+  base_name: string;
+  add_name: string;
+  source_filename: string;
+  source_sheet: string;
+  source_row_base: number;
+  source_row_add: number;
+  import_job_id: string;
+  created_at: string;
+}): SearchHit {
+  return {
+    id: r.id,
+    rank: r.rank,
+    result_mode: "materialized",
+    composite_art: r.composite_art_original,
+    composite_art_normalized: r.composite_art_normalized,
+    base_art: r.base_art,
+    add_art: r.add_art,
+    display_name: r.display_name,
+    base_name: r.base_name,
+    add_name: r.add_name,
+    source_filename: r.source_filename,
+    source_sheet: r.source_sheet,
+    source_row_base: r.source_row_base,
+    source_row_add: r.source_row_add,
+    import_job_id: r.import_job_id,
+    created_at: r.created_at,
+  };
 }
 
 export function searchItems(
@@ -59,17 +90,42 @@ export function searchItems(
   const key = searchCacheKey(query, limit);
   const cached = searchCacheGet(gen, key);
   if (cached) return cached.items;
-  const materialized = searchItemsUncached(db, query, limit);
-  const lazy = searchLazySynthetic(db, query, limit);
-  const items = mergeHits(materialized, lazy, limit);
+
+  const parsed = parseSearchQuery(query);
+  const parts: SearchHit[][] = [];
+
+  if (parsed.nameTokens.length > 0 && parsed.addCode) {
+    parts.push(searchMaterializedByNameAdd(db, parsed, limit));
+    parts.push(searchLazyByNameAdd(db, parsed, limit));
+  } else if (parsed.addCode && (parsed.basePrefix || !parsed.articleFlat)) {
+    parts.push(searchMaterializedByAddCode(db, parsed, limit));
+    parts.push(searchLazyByAddCode(db, parsed, limit));
+  } else if (parsed.addCode && /^\d{4}$/.test(parsed.articleFlat)) {
+    parts.push(searchMaterializedByAddCode(db, parsed, limit));
+    parts.push(searchLazyByAddCode(db, parsed, limit));
+  } else if (parsed.articleFlat) {
+    parts.push(searchItemsUncached(db, query, parsed, limit));
+    parts.push(searchLazySynthetic(db, query, parsed, limit));
+  } else if (!parsed.namePart) {
+    parts.push(searchItemsUncached(db, query, parsed, limit));
+  }
+
+  const items = mergeHits(parts.flat(), limit);
   searchCacheSet(gen, key, items, items.length);
   return items;
 }
 
-function mergeHits(a: SearchHit[], b: SearchHit[], limit: number): SearchHit[] {
+function mergeHits(hits: SearchHit[], limit: number): SearchHit[] {
   const out: SearchHit[] = [];
   const seen = new Set<string>();
-  for (const h of [...a, ...b]) {
+  const sorted = [...hits].sort((a, b) => {
+    if (a.rank !== b.rank) return a.rank - b.rank;
+    const al = a.composite_art_normalized.length;
+    const bl = b.composite_art_normalized.length;
+    if (al !== bl) return al - bl;
+    return a.id - b.id;
+  });
+  for (const h of sorted) {
     const k = h.composite_art_normalized;
     if (seen.has(k)) continue;
     seen.add(k);
@@ -79,19 +135,87 @@ function mergeHits(a: SearchHit[], b: SearchHit[], limit: number): SearchHit[] {
   return out;
 }
 
+function searchMaterializedByNameAdd(
+  db: Database.Database,
+  parsed: ParsedSearchQuery,
+  limit: number
+): SearchHit[] {
+  const rows = db
+    .prepare(
+      `SELECT sv.*, 3 AS rank
+       FROM search_variants sv
+       WHERE sv.add_art = @addCode
+       ORDER BY sv.id ASC`
+    )
+    .all({ addCode: parsed.addCode }) as (Omit<
+    SearchHit,
+    "composite_art" | "rank" | "result_mode"
+  > & {
+    rank: number;
+    composite_art_original: string;
+  })[];
+
+  const normalizedPhrase = normalizeSearchText(parsed.namePart!);
+  return rows
+    .map((row) => {
+      const normalizedName = normalizeSearchText(row.base_name);
+      const allTokensMatch = parsed.nameTokens.every((token) =>
+        normalizedName.includes(token)
+      );
+      if (!allTokensMatch) return null;
+      const rank =
+        normalizedName === normalizedPhrase
+          ? 1
+          : normalizedName.startsWith(normalizedPhrase)
+            ? 2
+            : 3;
+      return mapSvRow({ ...row, rank });
+    })
+    .filter((row): row is SearchHit => row !== null)
+    .sort((a, b) => a.rank - b.rank || a.base_name.length - b.base_name.length)
+    .slice(0, limit);
+}
+
+function searchMaterializedByAddCode(
+  db: Database.Database,
+  parsed: ParsedSearchQuery,
+  limit: number
+): SearchHit[] {
+  const basePrefix = parsed.basePrefix ? `${parsed.basePrefix}%` : "%";
+  const rows = db
+    .prepare(
+      `SELECT sv.*, 1 AS rank
+       FROM search_variants sv
+       WHERE sv.add_art = @addCode
+         AND sv.composite_art_normalized LIKE @basePrefix
+       ORDER BY length(sv.base_art) ASC, sv.base_art ASC, sv.id ASC
+       LIMIT @limit`
+    )
+    .all({
+      addCode: parsed.addCode,
+      basePrefix,
+      limit,
+    }) as (Omit<SearchHit, "composite_art" | "rank" | "result_mode"> & {
+    rank: number;
+    composite_art_original: string;
+  })[];
+  return rows.map((row) => mapSvRow(row));
+}
+
 export function searchItemsUncached(
   db: Database.Database,
   query: string,
+  parsed: ParsedSearchQuery,
   limit = 50
 ): SearchHit[] {
-  const qraw = query.trim();
+  const qraw = parsed.raw;
   if (!qraw) return [];
 
-  const nq = normalizeCompositeSearchInput(qraw);
+  const nq = parsed.articleFlat;
   const qCompactOrig = compactUpperNoSpace(qraw);
   const qprefix = nq ? `${nq}%` : "";
   const qlike = `%${escapeLike(collapseSpaces(qraw))}%`;
-  const fts = ftsQueryFromUserInput(qraw);
+  const fts = ftsQueryFromUserInput(qraw, nq);
 
   const ftsClause = fts
     ? ` OR sv.id IN (SELECT rowid FROM search_variants_fts WHERE search_variants_fts MATCH @fts)`
@@ -128,7 +252,6 @@ export function searchItemsUncached(
     LIMIT @limit
   `;
 
-  const stmt = db.prepare(sql);
   const params: Record<string, string | number> = {
     nq,
     qcompact: qCompactOrig,
@@ -138,81 +261,176 @@ export function searchItemsUncached(
   };
   if (fts) params.fts = fts;
 
-  type SvRow = Omit<SearchHit, "composite_art" | "rank"> & {
+  const rows = db.prepare(sql).all(params) as (Omit<SearchHit, "composite_art" | "rank" | "result_mode"> & {
     rank: number;
     composite_art_original: string;
-  };
-  const rows = stmt.all(params) as SvRow[];
-  return rows.map((r) => ({
-    id: r.id,
-    rank: r.rank,
-    result_mode: "materialized",
-    composite_art: r.composite_art_original,
-    composite_art_normalized: r.composite_art_normalized,
-    base_art: r.base_art,
-    add_art: r.add_art,
-    display_name: r.display_name,
-    base_name: r.base_name,
-    add_name: r.add_name,
-    source_filename: r.source_filename,
-    source_sheet: r.source_sheet,
-    source_row_base: r.source_row_base,
-    source_row_add: r.source_row_add,
-    import_job_id: r.import_job_id,
-    created_at: r.created_at,
-  }));
+  })[];
+  return rows.map((r) => mapSvRow(r));
 }
 
-function buildLazyHit(
-  b: {
-    id: number;
-    base_art: string;
-    base_art_normalized: string;
-    base_name: string;
-    source_filename: string;
-    source_sheet: string;
-    source_row: number;
-  },
-  a: {
-    id: number;
-    add_art: string;
-    add_art_normalized: string;
-    add_name: string;
-    source_filename: string;
-    source_sheet: string;
-    source_row: number;
-  },
-  source: { originalFilename: string; importedFileId: number; importJobId: string }
-): SearchHit {
+type LazyPairRow = {
+  b_id: number;
+  base_art: string;
+  base_art_normalized: string;
+  base_name: string;
+  base_sheet: string;
+  base_row: number;
+  a_id: number;
+  add_art: string;
+  add_art_normalized: string;
+  add_name: string;
+  add_sheet: string;
+  add_row: number;
+  imported_file_id: number;
+  original_filename: string;
+  import_job_id: string;
+};
+
+function buildLazyHit(row: LazyPairRow, rank = 5): SearchHit {
   return {
-    id: -(b.id * 1_000_000 + a.id),
-    rank: 5,
+    id: -(row.b_id * 1_000_000 + row.a_id),
+    rank,
     result_mode: "lazy",
-    composite_art: `${b.base_art}-${a.add_art}`,
-    composite_art_normalized: `${b.base_art_normalized}${a.add_art_normalized}`,
-    base_art: b.base_art,
-    add_art: a.add_art,
-    display_name: `${b.base_name}, ${a.add_name}`,
-    base_name: b.base_name,
-    add_name: a.add_name,
-    source_filename: source.originalFilename,
-    source_sheet: `lazy/imported_files/${source.importedFileId}`,
-    source_row_base: b.source_row,
-    source_row_add: a.source_row,
-    import_job_id: source.importJobId || "lazy",
+    composite_art: `${row.base_art}-${row.add_art}`,
+    composite_art_normalized: `${row.base_art_normalized}${row.add_art_normalized}`,
+    base_art: row.base_art,
+    add_art: row.add_art,
+    display_name: mergeDisplayName(row.base_name, row.add_name),
+    base_name: row.base_name,
+    add_name: row.add_name,
+    source_filename: row.original_filename,
+    source_sheet:
+      row.base_sheet === row.add_sheet
+        ? row.base_sheet
+        : `${row.base_sheet} + ${row.add_sheet}`,
+    source_row_base: row.base_row,
+    source_row_add: row.add_row,
+    import_job_id: row.import_job_id || "lazy",
     created_at: "",
   };
 }
 
-function searchLazyExact(db: Database.Database, nq: string): SearchHit[] {
-  const sp = splitCompositeFlat(nq);
-  if (!sp) return [];
+function searchLazyByNameAdd(
+  db: Database.Database,
+  parsed: ParsedSearchQuery,
+  limit: number
+): SearchHit[] {
+  const rows = db
+    .prepare(
+      `SELECT b.id as b_id, b.base_art, b.base_art_normalized,
+              fb.file_base_name as base_name,
+              fb.source_sheet as base_sheet, fb.source_row as base_row,
+              a.id as a_id, a.add_art, a.add_art_normalized,
+              fa.file_add_name as add_name,
+              fa.source_sheet as add_sheet, fa.source_row as add_row,
+              f.id as imported_file_id, f.original_filename, f.import_job_id
+       FROM imported_files f
+       INNER JOIN import_file_bases fb ON fb.imported_file_id = f.id
+       INNER JOIN base_articles b ON b.id = fb.base_article_id
+       INNER JOIN import_file_adds fa ON fa.imported_file_id = f.id
+       INNER JOIN add_articles a ON a.id = fa.add_article_id
+       WHERE f.materialization_mode = 'lazy'
+         AND a.add_art = @addCode
+       ORDER BY f.id DESC`
+    )
+    .all({ addCode: parsed.addCode }) as LazyPairRow[];
+
+  const phrase = normalizeSearchText(parsed.namePart!);
+  return rows
+    .map((row) => {
+      const normalizedName = normalizeSearchText(row.base_name);
+      if (!parsed.nameTokens.every((token) => normalizedName.includes(token))) {
+        return null;
+      }
+      const rank =
+        normalizedName === phrase
+          ? 1
+          : normalizedName.startsWith(phrase)
+            ? 2
+            : 3;
+      return buildLazyHit(row, rank);
+    })
+    .filter((row): row is SearchHit => row !== null)
+    .sort((a, b) => a.rank - b.rank || a.base_name.length - b.base_name.length)
+    .slice(0, limit);
+}
+
+function searchLazyByAddCode(
+  db: Database.Database,
+  parsed: ParsedSearchQuery,
+  limit: number
+): SearchHit[] {
+  const basePrefix = parsed.basePrefix ? `${parsed.basePrefix}%` : "%";
+  const rows = db
+    .prepare(
+      `SELECT b.id as b_id, b.base_art, b.base_art_normalized,
+              fb.file_base_name as base_name,
+              fb.source_sheet as base_sheet, fb.source_row as base_row,
+              a.id as a_id, a.add_art, a.add_art_normalized,
+              fa.file_add_name as add_name,
+              fa.source_sheet as add_sheet, fa.source_row as add_row,
+              f.id as imported_file_id, f.original_filename, f.import_job_id
+       FROM imported_files f
+       INNER JOIN import_file_bases fb ON fb.imported_file_id = f.id
+       INNER JOIN base_articles b ON b.id = fb.base_article_id
+       INNER JOIN import_file_adds fa ON fa.imported_file_id = f.id
+       INNER JOIN add_articles a ON a.id = fa.add_article_id
+       WHERE f.materialization_mode = 'lazy'
+         AND a.add_art = @addCode
+         AND b.base_art_normalized LIKE @basePrefix
+       ORDER BY b.base_art_normalized ASC, f.id DESC
+       LIMIT @limit`
+    )
+    .all({
+      addCode: parsed.addCode,
+      basePrefix,
+      limit,
+    }) as LazyPairRow[];
+  return rows.map((row) => buildLazyHit(row, 1));
+}
+
+function searchLazyExact(
+  db: Database.Database,
+  raw: string,
+  flat: string
+): SearchHit[] {
+  let er: string | null = null;
+  let add: string | null = null;
+  const sp = splitCompositeFromQuery(raw, flat);
+  if (sp) {
+    er = sp.er;
+    add = sp.add;
+  } else if (flat) {
+    const validated = db
+      .prepare(
+        `SELECT b.base_art_normalized as er_norm,
+                a.add_art_normalized as add_norm
+         FROM imported_files f
+         INNER JOIN import_file_bases fb ON fb.imported_file_id = f.id
+         INNER JOIN base_articles b ON b.id = fb.base_article_id
+         INNER JOIN import_file_adds fa ON fa.imported_file_id = f.id
+         INNER JOIN add_articles a ON a.id = fa.add_article_id
+         WHERE f.materialization_mode = 'lazy'
+           AND (b.base_art_normalized || a.add_art_normalized) = ?
+         LIMIT 1`
+      )
+      .get(flat) as { er_norm: string; add_norm: string } | undefined;
+    if (validated) {
+      er = validated.er_norm;
+      add = validated.add_norm;
+    }
+  }
+  if (!er || !add) return [];
+
   const row = db
     .prepare(
-      `SELECT
-         b.id as b_id, b.base_art, b.base_art_normalized, b.base_name, b.source_filename as b_file, b.source_sheet as b_sheet, b.source_row as b_row,
-         a.id as a_id, a.add_art, a.add_art_normalized, a.add_name, a.source_filename as a_file, a.source_sheet as a_sheet, a.source_row as a_row,
-         f.id as imported_file_id, f.original_filename, f.import_job_id
+      `SELECT b.id as b_id, b.base_art, b.base_art_normalized,
+              fb.file_base_name as base_name,
+              fb.source_sheet as base_sheet, fb.source_row as base_row,
+              a.id as a_id, a.add_art, a.add_art_normalized,
+              fa.file_add_name as add_name,
+              fa.source_sheet as add_sheet, fa.source_row as add_row,
+              f.id as imported_file_id, f.original_filename, f.import_job_id
        FROM imported_files f
        INNER JOIN import_file_bases fb ON fb.imported_file_id = f.id
        INNER JOIN base_articles b ON b.id = fb.base_article_id
@@ -224,58 +442,9 @@ function searchLazyExact(db: Database.Database, nq: string): SearchHit[] {
        ORDER BY f.id DESC
        LIMIT 1`
     )
-    .get(sp.er, sp.add) as
-    | {
-        b_id: number;
-        base_art: string;
-        base_art_normalized: string;
-        base_name: string;
-        b_file: string;
-        b_sheet: string;
-        b_row: number;
-        a_id: number;
-        add_art: string;
-        add_art_normalized: string;
-        add_name: string;
-        a_file: string;
-        a_sheet: string;
-        a_row: number;
-        imported_file_id: number;
-        original_filename: string;
-        import_job_id: string;
-      }
-    | undefined;
+    .get(er, add) as LazyPairRow | undefined;
   if (!row) return [];
-  return [
-    {
-      ...buildLazyHit(
-        {
-          id: row.b_id,
-          base_art: row.base_art,
-          base_art_normalized: row.base_art_normalized,
-          base_name: row.base_name,
-          source_filename: row.b_file,
-          source_sheet: row.b_sheet,
-          source_row: row.b_row,
-        },
-        {
-          id: row.a_id,
-          add_art: row.add_art,
-          add_art_normalized: row.add_art_normalized,
-          add_name: row.add_name,
-          source_filename: row.a_file,
-          source_sheet: row.a_sheet,
-          source_row: row.a_row,
-        },
-        {
-          originalFilename: row.original_filename,
-          importedFileId: row.imported_file_id,
-          importJobId: row.import_job_id,
-        }
-      ),
-      rank: 1,
-    },
-  ];
+  return [{ ...buildLazyHit(row, 1), rank: 1 }];
 }
 
 function splitLazyPrefixes(nq: string): { erPrefix: string; addPrefix: string } {
@@ -295,8 +464,12 @@ function searchLazyPrefix(
   const { erPrefix, addPrefix } = splitLazyPrefixes(nq);
   const rows = db
     .prepare(
-      `SELECT b.id as b_id, b.base_art, b.base_art_normalized, b.base_name, b.source_filename as b_file, b.source_sheet as b_sheet, b.source_row as b_row,
-              a.id as a_id, a.add_art, a.add_art_normalized, a.add_name, a.source_filename as a_file, a.source_sheet as a_sheet, a.source_row as a_row,
+      `SELECT b.id as b_id, b.base_art, b.base_art_normalized,
+              fb.file_base_name as base_name,
+              fb.source_sheet as base_sheet, fb.source_row as base_row,
+              a.id as a_id, a.add_art, a.add_art_normalized,
+              fa.file_add_name as add_name,
+              fa.source_sheet as add_sheet, fa.source_row as add_row,
               f.id as imported_file_id, f.original_filename, f.import_job_id
        FROM imported_files f
        INNER JOIN import_file_bases fb ON fb.imported_file_id = f.id
@@ -313,25 +486,8 @@ function searchLazyPrefix(
       bp: `${erPrefix}%`,
       ap: `${addPrefix}%`,
       candidate: Math.max(limit * LAZY_SEARCH_SCOPE_LIMIT, LAZY_SEARCH_CANDIDATE_LIMIT),
-    }) as {
-    b_id: number;
-    base_art: string;
-    base_art_normalized: string;
-    base_name: string;
-    b_file: string;
-    b_sheet: string;
-    b_row: number;
-    a_id: number;
-    add_art: string;
-    add_art_normalized: string;
-    add_name: string;
-    a_file: string;
-    a_sheet: string;
-    a_row: number;
-    imported_file_id: number;
-    original_filename: string;
-    import_job_id: string;
-  }[];
+    }) as LazyPairRow[];
+
   const out: SearchHit[] = [];
   const seen = new Set<string>();
   for (const r of rows) {
@@ -339,33 +495,7 @@ function searchLazyPrefix(
     if (!compositeNorm.startsWith(nq)) continue;
     if (seen.has(compositeNorm)) continue;
     seen.add(compositeNorm);
-    out.push(
-      buildLazyHit(
-        {
-          id: r.b_id,
-          base_art: r.base_art,
-          base_art_normalized: r.base_art_normalized,
-          base_name: r.base_name,
-          source_filename: r.b_file,
-          source_sheet: r.b_sheet,
-          source_row: r.b_row,
-        },
-        {
-          id: r.a_id,
-          add_art: r.add_art,
-          add_art_normalized: r.add_art_normalized,
-          add_name: r.add_name,
-          source_filename: r.a_file,
-          source_sheet: r.a_sheet,
-          source_row: r.a_row,
-        },
-        {
-          originalFilename: r.original_filename,
-          importedFileId: r.imported_file_id,
-          importJobId: r.import_job_id,
-        }
-      )
-    );
+    out.push(buildLazyHit(r));
     if (out.length >= limit) break;
   }
   return out;
@@ -374,16 +504,43 @@ function searchLazyPrefix(
 function searchLazySynthetic(
   db: Database.Database,
   query: string,
+  parsed: ParsedSearchQuery,
   limit: number
 ): SearchHit[] {
-  const nq = normalizeCompositeSearchInput(query.trim());
+  const nq = parsed.articleFlat;
   if (!nq) return [];
-  const exact = searchLazyExact(db, nq);
+  const exact = searchLazyExact(db, query, nq);
   if (exact.length > 0) return exact.slice(0, limit);
   return searchLazyPrefix(db, nq, limit);
 }
 
 export function getItemById(db: Database.Database, id: number): SearchHit | undefined {
+  if (id < 0) {
+    const bId = Math.floor(-id / 1_000_000);
+    const aId = -id % 1_000_000;
+    const row = db
+      .prepare(
+        `SELECT b.id as b_id, b.base_art, b.base_art_normalized,
+                fb.file_base_name as base_name,
+                fb.source_sheet as base_sheet, fb.source_row as base_row,
+                a.id as a_id, a.add_art, a.add_art_normalized,
+                fa.file_add_name as add_name,
+                fa.source_sheet as add_sheet, fa.source_row as add_row,
+                f.id as imported_file_id, f.original_filename, f.import_job_id
+         FROM imported_files f
+         INNER JOIN import_file_bases fb ON fb.imported_file_id = f.id
+         INNER JOIN base_articles b ON b.id = fb.base_article_id
+         INNER JOIN import_file_adds fa ON fa.imported_file_id = f.id
+         INNER JOIN add_articles a ON a.id = fa.add_article_id
+         WHERE b.id = ? AND a.id = ?
+         ORDER BY f.id DESC
+         LIMIT 1`
+      )
+      .get(bId, aId) as LazyPairRow | undefined;
+    if (!row) return undefined;
+    return buildLazyHit(row, 0);
+  }
+
   const row = db.prepare(`SELECT * FROM search_variants WHERE id = ?`).get(id) as
     | {
         id: number;
@@ -403,22 +560,5 @@ export function getItemById(db: Database.Database, id: number): SearchHit | unde
       }
     | undefined;
   if (!row) return undefined;
-  return {
-    id: row.id,
-    rank: 0,
-    result_mode: "materialized",
-    composite_art: row.composite_art_original,
-    composite_art_normalized: row.composite_art_normalized,
-    base_art: row.base_art,
-    add_art: row.add_art,
-    display_name: row.display_name,
-    base_name: row.base_name,
-    add_name: row.add_name,
-    source_filename: row.source_filename,
-    source_sheet: row.source_sheet,
-    source_row_base: row.source_row_base,
-    source_row_add: row.source_row_add,
-    import_job_id: row.import_job_id,
-    created_at: row.created_at,
-  };
+  return mapSvRow({ ...row, rank: 0 });
 }

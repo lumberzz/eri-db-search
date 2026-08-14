@@ -8,7 +8,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "sample:xlsx": "tsx scripts/generate-sample-xlsx.ts",
-    "test": "tsx --test src/domain/erArticles.test.ts src/normalize.test.ts src/services/searchCache.test.ts src/integration/dedupeAndDb.test.ts src/services/materializationPolicy.test.ts src/services/lazySearch.test.ts src/integration/lazyImportLargePolicy.test.ts",
+    "test": "tsx src/ingest/parseWorkbookStream.test.ts && tsx --test --test-concurrency=1 src/domain/erArticles.test.ts src/domain/filePairs.test.ts src/normalize.test.ts src/services/searchCache.test.ts src/services/searchQueryParse.test.ts src/integration/dedupeAndDb.test.ts src/services/materializationPolicy.test.ts src/services/lazySearch.test.ts src/integration/lazyImportLargePolicy.test.ts src/integration/sequentialPairing.test.ts",
     "perf:smoke": "tsx scripts/perf-smoke.ts"
   },
   "dependencies": {

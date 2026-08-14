@@ -202,12 +202,16 @@ export async function listRecentJobs(limit = 10): Promise<JobPollState[]> {
   }));
 }
 
-export async function search(q: string, limit = 80): Promise<{
+export async function search(
+  q: string,
+  limit = 80,
+  signal?: AbortSignal
+): Promise<{
   items: SearchItem[];
   count: number;
 }> {
   const params = new URLSearchParams({ q, limit: String(limit) });
-  const res = await fetch(`${base}/api/search?${params}`);
+  const res = await fetch(`${base}/api/search?${params}`, { signal });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }

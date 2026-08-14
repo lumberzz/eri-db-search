@@ -38,10 +38,16 @@ test("lazy exact search returns synthetic result", () => {
       .run(jid).lastInsertRowid
   );
   db.prepare(
-    `INSERT INTO import_file_bases (imported_file_id, base_article_id) VALUES (?, ?)`
+    `INSERT INTO import_file_bases (
+      imported_file_id, base_article_id, file_base_art, file_base_name,
+      source_sheet, source_row
+    ) VALUES (?, ?, 'ER0100', 'B', 'S', 2)`
   ).run(fId, bid);
   db.prepare(
-    `INSERT INTO import_file_adds (imported_file_id, add_article_id) VALUES (?, ?)`
+    `INSERT INTO import_file_adds (
+      imported_file_id, add_article_id, file_add_art, file_add_name,
+      source_sheet, source_row
+    ) VALUES (?, ?, '0001', 'A', 'S', 3)`
   ).run(fId, aid);
 
   const out = searchItems(db, "ER0100-0001", 10);
@@ -49,7 +55,9 @@ test("lazy exact search returns synthetic result", () => {
   assert.equal(out[0]?.result_mode, "lazy");
   assert.equal(out[0]?.composite_art_normalized, compositeNormalizedKey("ER0100", "0001"));
   assert.equal(out[0]?.source_filename, "f.xlsx");
-  assert.ok(String(out[0]?.source_sheet || "").startsWith("lazy/imported_files/"));
+  assert.equal(out[0]?.source_sheet, "S");
+  assert.equal(out[0]?.source_row_base, 2);
+  assert.equal(out[0]?.source_row_add, 3);
 
   db.close();
   fs.unlinkSync(p);

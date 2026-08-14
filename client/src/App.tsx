@@ -1,6 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
-  getItem,
   importFiles,
   listRecentJobs,
   search,
@@ -103,63 +102,57 @@ export default function App() {
     [refreshRecent]
   );
 
-  const runSearch = useMemo(() => {
-    let t: ReturnType<typeof setTimeout>;
-    return (value: string) => {
-      clearTimeout(t);
-      t = setTimeout(async () => {
-        const v = value.trim();
-        if (!v) {
-          setResults([]);
-          setSearchState("idle");
-          return;
-        }
-        setSearchState("loading");
-        try {
-          const { items } = await search(v);
-          setResults(items);
-          setSearchState("idle");
-        } catch {
-          setSearchState("error");
-        }
-      }, 220);
-    };
-  }, []);
-
   useEffect(() => {
-    runSearch(q);
-  }, [q, runSearch]);
+    const controller = new AbortController();
+    const timer = setTimeout(async () => {
+      const value = q.trim();
+      setSelected(null);
+      setDetail(null);
+      if (!value) {
+        setResults([]);
+        setSearchState("idle");
+        return;
+      }
+      setSearchState("loading");
+      try {
+        const { items } = await search(value, 80, controller.signal);
+        setResults(items);
+        setSearchState("idle");
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        setSearchState("error");
+      }
+    }, 220);
+
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [q]);
 
   useEffect(() => {
     if (!selected) {
       setDetail(null);
       return;
     }
-    if (selected.result_mode === "lazy") {
-      setDetail({
-        id: selected.id,
-        composite_art: selected.composite_art,
-        base_art: selected.base_art,
-        add_art: selected.add_art,
-        display_name: selected.display_name,
-        base_name: selected.base_name,
-        add_name: selected.add_name,
-        source_filename: selected.source_filename,
-        source_sheet: selected.source_sheet,
-        source_row_base: selected.source_row_base,
-        source_row_add: selected.source_row_add,
-        import_job_id: selected.import_job_id,
-      });
-      setDetailState("idle");
-      return;
-    }
-    setDetailState("loading");
-    getItem(selected.id)
-      .then((d) => {
-        setDetail(d);
-        setDetailState("idle");
-      })
-      .catch(() => setDetailState("error"));
+    setDetail({
+      id: selected.id,
+      composite_art: selected.composite_art,
+      composite_art_normalized: selected.composite_art_normalized,
+      base_art: selected.base_art,
+      add_art: selected.add_art,
+      display_name: selected.display_name,
+      base_name: selected.base_name,
+      add_name: selected.add_name,
+      source_filename: selected.source_filename,
+      source_sheet: selected.source_sheet,
+      source_row_base: selected.source_row_base,
+      source_row_add: selected.source_row_add,
+      import_job_id: selected.import_job_id,
+      created_at: selected.created_at,
+      result_mode: selected.result_mode,
+    });
+    setDetailState("idle");
   }, [selected]);
 
   const showPanel = importState === "loading" || (liveProgress?.files?.length ?? 0) > 0;
@@ -179,7 +172,7 @@ export default function App() {
         <h2>Поиск</h2>
         <input
           className="search-input"
-          placeholder="Составной артикул (ER…-0001 или без дефиса)"
+          placeholder="Артикул (ER…-0001), имя базы + код (напр. Коробка 0001)"
           value={q}
           onChange={(e) => setQ(e.target.value)}
         />
@@ -432,6 +425,8 @@ function ItemDetail({ data }: { data: Record<string, unknown> }) {
       <dl>
         <dt>Составной артикул</dt>
         <dd className="mono">{String(data.composite_art ?? "")}</dd>
+        <dt>Нормализованный ключ</dt>
+        <dd className="mono">{String(data.composite_art_normalized ?? "—")}</dd>
         <dt>Базовый ER</dt>
         <dd className="mono">{String(data.base_art ?? "")}</dd>
         <dt>Добавочный код</dt>
@@ -442,6 +437,8 @@ function ItemDetail({ data }: { data: Record<string, unknown> }) {
         <dd>{String(data.base_name ?? "—")}</dd>
         <dt>Имя добавки</dt>
         <dd>{String(data.add_name ?? "—")}</dd>
+        <dt>Лист</dt>
+        <dd>{String(data.source_sheet ?? "—")}</dd>
         <dt>Файл / строки (база + добавка)</dt>
         <dd>
           {String(data.source_filename)} / {String(data.source_row_base)} +{" "}
@@ -449,6 +446,10 @@ function ItemDetail({ data }: { data: Record<string, unknown> }) {
         </dd>
         <dt>Импорт (job)</dt>
         <dd className="mono">{String(data.import_job_id)}</dd>
+        <dt>Режим результата</dt>
+        <dd>{String(data.result_mode ?? "materialized")}</dd>
+        <dt>Дата создания</dt>
+        <dd>{String(data.created_at || "—")}</dd>
       </dl>
     </div>
   );

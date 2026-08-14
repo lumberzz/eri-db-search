@@ -38,6 +38,36 @@ function scoreHeaderRow(values: string[]): number {
   return values.filter((v) => v.trim().length > 0).length;
 }
 
+export function detectHeaderBoundary(
+  rows: { rowNumber: number; values: string[] }[]
+): { headerRowIndex: number; maxCol: number } | null {
+  const sorted = [...rows].sort((a, b) => a.rowNumber - b.rowNumber);
+  for (const row of sorted) {
+    const article = row.values[COL_ART]?.trim() ?? "";
+    if (isBaseErArticle(article) || isAddFourDigitArticle(article)) {
+      return {
+        headerRowIndex: row.rowNumber - 1,
+        maxCol: Math.max(row.values.length, 8),
+      };
+    }
+  }
+
+  let bestScore = 0;
+  let bestRow = 1;
+  let bestMaxCol = 8;
+  for (const row of sorted) {
+    const score = scoreHeaderRow(row.values);
+    if (score > bestScore) {
+      bestScore = score;
+      bestRow = row.rowNumber;
+      bestMaxCol = Math.max(row.values.length, 8);
+    }
+  }
+  return bestScore > 0
+    ? { headerRowIndex: bestRow, maxCol: bestMaxCol }
+    : null;
+}
+
 export type StreamHandlers = {
   onRow: (ev: StreamRowEvent) => Promise<void>;
   yieldEvery: number;
@@ -106,20 +136,17 @@ export async function parseXlsxFileStream(
         });
         return false;
       }
-      let best = 0;
-      let bestRow = 1;
-      for (let r = 1; r <= 15; r++) {
-        const row = buffered.get(r);
-        if (!row) continue;
-        const values = rowValues(row, Math.max(row.actualCellCount, 8));
-        const sc = scoreHeaderRow(values);
-        if (sc > best) {
-          best = sc;
-          bestRow = r;
-          maxCol = Math.max(values.length, 8);
-        }
-      }
-      if (best === 0) {
+
+      // Many production workbooks have no header and begin with data in row 1.
+      // The old "most non-empty cells" heuristic treated an arbitrary data row
+      // as a header and discarded every row before it.
+      const boundary = detectHeaderBoundary(
+        [...buffered.entries()].map(([rowNumber, row]) => ({
+          rowNumber,
+          values: rowValues(row, Math.max(row.actualCellCount, 8)),
+        }))
+      );
+      if (!boundary) {
         await emitIssue({
           filename: logicalFilename,
           sheet: acc.sheet,
@@ -128,7 +155,8 @@ export async function parseXlsxFileStream(
         });
         return false;
       }
-      headerRowIndex = bestRow;
+      headerRowIndex = boundary.headerRowIndex;
+      maxCol = boundary.maxCol;
       return true;
     };
 

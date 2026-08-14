@@ -80,11 +80,20 @@ export async function parseXlsxBuffer(
     let maxCol = 0;
     let headerRowIndex = 1;
     let bestScore = 0;
+    let firstDataRow: number | null = null;
 
     for (let r = 1; r <= 15; r++) {
       const row = worksheet.getRow(r);
       if (!row.actualCellCount) continue;
       const values = rowValues(row, Math.max(row.actualCellCount, 8));
+      const article = values[COL_ART]?.trim() ?? "";
+      if (
+        firstDataRow == null &&
+        (isBaseErArticle(article) || isAddFourDigitArticle(article))
+      ) {
+        firstDataRow = r;
+        maxCol = Math.max(values.length, 8);
+      }
       const score = values.filter((v) => v.trim().length > 0).length;
       if (score > bestScore) {
         bestScore = score;
@@ -94,7 +103,9 @@ export async function parseXlsxBuffer(
       }
     }
 
-    if (headers.length === 0) {
+    if (firstDataRow != null) {
+      headerRowIndex = firstDataRow - 1;
+    } else if (headers.length === 0) {
       issues.push({
         filename,
         sheet: worksheet.name,

@@ -22,9 +22,13 @@ async function writeSmallWorkbook(filePath: string): Promise<void> {
   const ws = wb.addWorksheet("Sheet1");
   ws.addRow(["#", "Артикул", "x", "Наименование"]);
   ws.addRow(["1", "ER0001", "", "Base One"]);
-  ws.addRow(["2", "ER0002", "", "Base Two"]);
-  ws.addRow(["3", "0001", "", "Add One"]);
+  ws.addRow(["2", "0001", "", "Add One"]);
+  ws.addRow(["3", "ER0002", "", "Base Two"]);
   ws.addRow(["4", "0002", "", "Add Two"]);
+  ws.addRow(["5", "ER0003", "", "Base Three"]);
+  ws.addRow(["6", "0003", "", "Add Three"]);
+  ws.addRow(["7", "ER0004", "", "Base Four"]);
+  ws.addRow(["8", "0004", "", "Add Four"]);
   await wb.xlsx.writeFile(filePath);
 }
 
@@ -46,13 +50,17 @@ test("high estimatedPairs path uses lazy and persists membership for search", as
       policyOverride: {
         warnPairs: 1,
         lazyPairs: 2,
-        rejectPairs: 3, // 2 bases * 2 adds = 4 => forced lazy
+        rejectPairs: 3, // 4 bases * 4 additions => forced lazy
       },
     }
   );
 
   assert.equal(res.status, "completed");
-  assert.equal(res.files[0]?.materializationMode, "lazy");
+  assert.equal(
+    res.files[0]?.materializationMode,
+    "lazy",
+    JSON.stringify(res.files[0])
+  );
 
   const imported = db
     .prepare(
@@ -78,6 +86,19 @@ test("high estimatedPairs path uses lazy and persists membership for search", as
   const hits = searchItems(db, "ER0001-0001", 20);
   assert.ok(hits.length > 0);
   assert.equal(hits[0]?.result_mode, "lazy");
+  assert.equal(hits[0]?.add_art, "0001");
+  assert.equal(hits[0]?.add_name, "Add One");
+  assert.equal(hits[0]?.source_row_add, 3);
+
+  const cross = searchItems(db, "ER0001-0002", 20);
+  assert.equal(cross.length, 1);
+  assert.equal(cross[0]?.add_name, "Add Two");
+  assert.equal(cross[0]?.source_row_base, 2);
+  assert.equal(cross[0]?.source_row_add, 5);
+
+  const byName = searchItems(db, "one base 0002", 20);
+  assert.equal(byName.length, 1);
+  assert.equal(byName[0]?.base_art, "ER0001");
 
   db.close();
   try {

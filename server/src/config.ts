@@ -6,16 +6,7 @@ export const VARIANT_INSERT_BATCH = Math.max(
   parseInt(process.env.VARIANT_INSERT_BATCH || "1500", 10) || 1500
 );
 
-/** Пагинация уникальных add при декартовом умножении (не держим все adds в RAM). */
-export const ADD_ARTICLE_PAGE = Math.max(
-  100,
-  parseInt(process.env.ADD_ARTICLE_PAGE || "400", 10) || 400
-);
-
-export const BASE_ARTICLE_PAGE = Math.max(
-  100,
-  parseInt(process.env.BASE_ARTICLE_PAGE || "400", 10) || 400
-);
+/** Пакетная вставка явных пар база→добавка при materialization. */
 
 export const ROW_PARSE_YIELD_EVERY = Math.max(
   50,

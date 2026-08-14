@@ -183,8 +183,8 @@ export function apiRouter(db: Database.Database, opts: ApiOpts): Router {
   });
 
   r.get("/items/:id", (req, res) => {
-    const id = parseInt(req.params.id, 10);
-    if (!Number.isFinite(id)) {
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id) || id === 0) {
       res.status(400).json({ error: "Некорректный id" });
       return;
     }

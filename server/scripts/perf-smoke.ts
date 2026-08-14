@@ -2,7 +2,7 @@
  * Быстрая ручная проверка: поднимает in-memory сценарий с большим числом пар
  * без UI. Запуск: `npm run perf:smoke` из каталога server.
  *
- * Переменные окружения: VARIANT_INSERT_BATCH, BASE_ARTICLE_PAGE, ADD_ARTICLE_PAGE.
+ * Переменные окружения: VARIANT_INSERT_BATCH.
  */
 import fs from "node:fs";
 import os from "node:os";
@@ -11,6 +11,7 @@ import { performance } from "node:perf_hooks";
 import { randomUUID } from "node:crypto";
 import { openDatabase } from "../src/db.js";
 import { normalizeArticle } from "../src/normalize.js";
+import type { FileArticlePair } from "../src/domain/filePairs.js";
 import { materializeVariantsChunked } from "../src/services/importPipeline.js";
 
 const tmp = path.join(os.tmpdir(), `eri-perf-${randomUUID()}.sqlite`);
@@ -67,14 +68,33 @@ function main(): void {
   }
   console.log(`insert bases/adds ms: ${Math.round(performance.now() - tIns0)}`);
 
+  const pairs: FileArticlePair[] = [];
+  for (let i = 0; i < nb; i++) {
+    const baseArt = `ER${String(1000 + i)}`;
+    const baseNorm = normalizeArticle(baseArt);
+    for (let j = 0; j < na; j++) {
+      const addArt = String(1000 + j).slice(-4).padStart(4, "0");
+      pairs.push({
+        baseNorm,
+        addNorm: normalizeArticle(addArt),
+        baseArt,
+        addArt,
+        baseName: `Base ${i}`,
+        addName: `Add ${j}`,
+        sourceSheet: "S",
+        sourceRowBase: i + 2,
+        sourceRowAdd: j + 2 + nb,
+      });
+    }
+  }
+
   let lastReport = performance.now();
   const tVar0 = performance.now();
   const { inserted, skipped } = materializeVariantsChunked(
     db,
     jobId,
     filename,
-    baseNorms,
-    addNorms,
+    pairs,
     () => {
       const now = performance.now();
       if (now - lastReport > 2000) {
